@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <string.h>
+#include <unistd.h>
 
 #define NUM_ARTICLES_TYPES 3
 
@@ -50,13 +51,17 @@ typedef struct {
 } Dispatcher;
 
 typedef struct {
-    BoundedBuffer* DispatcherBuffer; // Shared buffer between Dispatcher and Co-Editors
-    BoundedBuffer* ManagerBuffer; // Manager's buffer
-} CoEditor;
-
-typedef struct {
-    UnboundedBuffer* ManagerBuffer; // Manager's buffer
+    BoundedBuffer* SharedBuffer; // Manager's buffer
+    sem_t doneSemaphore; // Semaphore for the "DONE" messages
+    int doneCount; // Count of "DONE" messages
 } Manager;
+
+// The coEditorThread function now takes in a structure that contains two buffers:
+// one for the Dispatcher and one for the Manager. This structure is created in main before the co-editor threads are created.
+typedef struct {
+    UnboundedBuffer* dispatcherBuffer;
+    BoundedBuffer* SharedBuffer;
+} CoEditor;
 
 char* parse_message_type(char* message);
 int get_type_index(char* type);
@@ -90,7 +95,7 @@ Config* parse_config(const char* filename) {
     while (fscanf(file, "%d\n%d\n%d\n", &tempNumPrducer, &NumArticles, &QueueLength) == 3) {
 
         // If the array is full, double its size
-        if (tempNumPrducer > capacity) {
+        if (tempNumPrducer >= capacity) {
             capacity *= 2;
             ArrayProducers = realloc(ArrayProducers, capacity * sizeof(Producer));
             if (ArrayProducers == NULL) {
@@ -188,12 +193,16 @@ void insertBoundedBuffer(BoundedBuffer* buffer, char* article) {
     // If slotsSemaphore value is more then zero it means there are free slots and we can continue. This line will decremnt the free slots,
     // Otherwise, if slotsSemaphore value is zero sem_wait will  block the calling thread. (the thread will be stuck in this line).
     sem_wait(&buffer -> slotsSemaphore); // Decrement free slots
+//    printf("Before inserting in BoundedBuffer: buffer->in = %d, buffer->size = %d, inserting article: %s\n",
+//           buffer->in, buffer->size, article);
     // Acquiring the mutex lock to enter the critical section
     sem_wait(&buffer -> mutexSemaphore); // Enter critical section
     buffer -> buffer[buffer -> in] = article; // Insert article
     buffer -> in = (buffer -> in + 1) % buffer -> size; // Updates the in index to point to the next free slot in the buffer.
     sem_post(&buffer -> mutexSemaphore); // Exit critical section and releasing the mutex lock.
     sem_post(&buffer -> articlesSemaphore); // Increment items
+//    printf("After inserting in BoundedBuffer: buffer->in = %d\n", buffer->in);
+
 }
 
 /*
@@ -205,7 +214,14 @@ void insertUnboundedBuffer(UnboundedBuffer* buffer, char* article) {
     if (buffer -> in == buffer -> size) { // If buffer is full
         // Resize the buffer (double the size)
         buffer -> size *= 2;
-        buffer -> buffer = realloc(buffer -> buffer, buffer -> size * sizeof(char*));
+        //buffer -> buffer = realloc(buffer -> buffer, buffer -> size * sizeof(char*));
+        char **temp = realloc(buffer -> buffer, buffer -> size * sizeof(char*));
+        if (temp == NULL) {
+            perror("Failed to reallocate memory");
+            // Handle error here - you might choose to return from the function or otherwise clean up
+        } else {
+            buffer -> buffer = temp;
+        }
     }
 
     buffer -> buffer[buffer -> in] = article; // Insert item
@@ -221,14 +237,16 @@ void insertUnboundedBuffer(UnboundedBuffer* buffer, char* article) {
 char* removeBoundedBuffer(BoundedBuffer* buffer) {
     sem_wait(&buffer->articlesSemaphore); // Decrement the number of items
     sem_wait(&buffer->mutexSemaphore); // Enter critical section
-
+//    printf("Before removing from BoundedBuffer: buffer->out = %d, buffer->size = %d\n",
+//           buffer->out, buffer->size);
     char* item = buffer->buffer[buffer->out];
     buffer->buffer[buffer->out] = NULL; // Clear the slot
     buffer->out = (buffer->out + 1) % buffer->size; // Increment 'out'
 
     sem_post(&buffer->mutexSemaphore); // Exit critical section
     sem_post(&buffer->slotsSemaphore); // Increment the number of free slots
-
+//    printf("After removing from BoundedBuffer: buffer->out = %d, removed article: %s\n",
+//           buffer->out, item);
     return item;
 }
 
@@ -239,12 +257,6 @@ char* removeUnboundedBuffer(UnboundedBuffer* buffer) {
     char* item = buffer->buffer[buffer->out];
     buffer->buffer[buffer->out] = NULL; // Clear the slot
     buffer->out += 1; // Increment 'out'
-
-    // If the buffer is less than 1/4 full, halve its size
-    if (buffer->in - buffer->out <= buffer->size / 4) {
-        buffer->size /= 2;
-        buffer->buffer = realloc(buffer->buffer, buffer->size * sizeof(char*));
-    }
 
     sem_post(&buffer->mutexSemaphore); // Exit critical section
 
@@ -258,7 +270,7 @@ void* producerThread(void* arg) {
         int i = rand() % NUM_ARTICLES_TYPES; // Choose a random type
         char* message = malloc(100);
         sprintf(message, "Producer %d %s %d", producer -> id, types[i], articleCounts[i]++);
-        printf("Producer %d inserted message: %s\n", producer -> id, message);
+        //printf("Producer %d inserted message: %s\n", producer -> id, message);
         insertBoundedBuffer(producer -> ProducerBuffer, message);
     }
     insertBoundedBuffer(producer -> ProducerBuffer, "DONE");
@@ -267,30 +279,55 @@ void* producerThread(void* arg) {
 
 void* dispatcherThread(void* arg) {
     Dispatcher* dispatcher = (Dispatcher*)arg;
+    // UPDATE:
     int done_count = 0;
     while (1) {
         if(dispatcher == NULL) {
             printf("Dispatcher is NULL\n");
             return NULL;
         }
-        for (int i = 0; i < dispatcher -> TotalNumProducers; ++i) {
+        for (int i = 0; i <= dispatcher -> TotalNumProducers; ++i) {
             if (dispatcher -> producers[i] != NULL) { // If this producer hasn't been terminated
-                char* message = removeBoundedBuffer(dispatcher->producers[i]-> ProducerBuffer); // Read news from the producer
+                char* message = removeBoundedBuffer(dispatcher -> producers[i]-> ProducerBuffer); // Read news from the producer
+                //printf("DISPATCHER Remove from the BOUNDED queue Message: %s\n", message);
                 if (message != NULL) {
                     if (strcmp(message, "DONE") == 0) {
                         // Handle "DONE" message
                         done_count++;
                         // Terminate and clean up this producer
+                        //printf("Producer %d sent DONE\n", i);
+
+                        // Terminate and clean up this producer
+//                        if (dispatcher -> producers[i] -> ProducerBuffer != NULL) {
+//                            //printf("Entering ProducerBuffer cleanup for producer %d\n", i);
+//                            if (dispatcher -> producers[i] -> ProducerBuffer -> buffer != NULL) {
+//                                //printf("Entering buffer cleanup for producer %d\n", i);
+//                                //free(dispatcher -> producers[i] -> ProducerBuffer -> buffer);
+//                                dispatcher -> producers[i] -> ProducerBuffer -> buffer = NULL;
+//                                //printf("Buffer cleanup done for producer %d\n", i);
+//                            }
+//                            //free(dispatcher -> producers[i] -> ProducerBuffer);
+//                            dispatcher -> producers[i] -> ProducerBuffer = NULL;
+//                            //printf("ProducerBuffer cleanup done for producer %d\n", i);
+//                        }
+//                        if (dispatcher -> producers[i] != NULL) {
+//                            //printf("Entering producer struct cleanup for producer %d\n", i);
+//                            free(dispatcher -> producers[i]);
+//                            dispatcher -> producers[i] = NULL;
+//                            //printf("Producer struct cleanup done for producer %d\n", i);
+//                        }
+
                         free(dispatcher -> producers[i] -> ProducerBuffer -> buffer); // Free the internal buffer
                         free(dispatcher -> producers[i] -> ProducerBuffer); // Free the bounded buffer struct
                         free(dispatcher -> producers[i]); // Free the producer struct
                         dispatcher -> producers[i] = NULL; // Set the pointer in the producers array to NULL
-                        if (done_count == dispatcher->TotalNumProducers) {
+                        if (done_count == dispatcher -> TotalNumProducers) {
                             // All producers are done, send "DONE" through each dispatcher's queue and exit loop
                             for (int j = 0; j < NUM_ARTICLES_TYPES; ++j) {
                                 insertUnboundedBuffer(dispatcher -> DispatcherBuffersArray[j], "DONE");
-                                printf("Inserted DONE message to the dispatcher queue %d\n", j);
+                                //printf("Inserted DONE message to the dispatcher queue %d\n", j);
                             }
+                            //printf("Dispatcher Finished and exit.");
                             return NULL; // Exit the dispatcher thread
                         }
                     } else {
@@ -301,7 +338,8 @@ void* dispatcherThread(void* arg) {
 
                         // Insert the message into the appropriate dispatcher's queue
                         insertUnboundedBuffer(dispatcher -> DispatcherBuffersArray[type_index], message);
-                        //printf("%s Inserted to the \"%c\" dispatcher queue\n", type, type_index + 'A');
+                        //printf("%s Inserted to the \"%c\" dispatcher queue. Message: %s\n", type, type_index + 'A', message);
+
 
                         // Update version. we add co-editors so now we need the dispatcher insert the messages to the co-editors buffers.
 
@@ -311,7 +349,6 @@ void* dispatcherThread(void* arg) {
             }
         }
     }
-    return NULL;
 }
 
 // Parse the message type
@@ -336,34 +373,44 @@ int get_type_index(char* type) {
 }
 
 void* coEditorThread(void* arg) {
-    CoEditor* coEditor = (CoEditor*)arg;
-    for (int i = 0; i < coEditor->TotalNumCoEditors; ++i) {
-        while(1) {
-            char* message = removeUnboundedBuffer(coEditor->coEditorBuffers[i]);
-            if (strcmp(message, "DONE") == 0) {
-                // If done, break the loop
-                break;
-            }
-            // Here, you can perform any modification to the message before sending it to the manager
-            printf("Co-editor %d edited message: %s\n", i, message);
-            // Send the message to the manager's buffer
-            insertUnboundedBuffer(manager->ManagerBuffer, message);
+    CoEditor* args = (CoEditor*)arg;
+    UnboundedBuffer* dispatcherBuffer = args -> dispatcherBuffer;
+    BoundedBuffer* managerBuffer = args -> SharedBuffer;
+
+    while (1) {
+        char* message = removeUnboundedBuffer(dispatcherBuffer);
+        if (strcmp(message, "DONE") == 0) {
+            insertBoundedBuffer(managerBuffer, "DONE"); // Forward the "DONE" message
+            break; // Exit the loop
         }
+        //printf("CoEditorThread received message: %s\n", message);
+
+        // Simulate editing
+        sleep((unsigned int) 0.01); // Wait for 0.1 seconds
+
+        insertBoundedBuffer(managerBuffer, message); // Forward the message to the manager
+        //printf("CoEditorThread forwarded message: %s\n", message);
+
     }
     return NULL;
 }
 
+
 void* managerThread(void* arg) {
     Manager* manager = (Manager*)arg;
     while(1) {
-        char* message = removeUnboundedBuffer(manager->ManagerBuffer);
+        char* message = removeBoundedBuffer(manager -> SharedBuffer);
         if (strcmp(message, "DONE") == 0) {
-            // If done, break the loop
-            break;
+            manager -> doneCount += 1; // Decrement doneCount for each "DONE" message
+            if (manager -> doneCount == 3) {
+                // Exit the loop when all "DONE" messages have been received
+                break;
+            }
+            continue;
         }
-        // Here, you can display the message or do anything you want with it
-        printf("Manager received message: %s\n", message);
+        printf("%s\n", message);
     }
+    printf("DONE");
     return NULL;
 }
 
@@ -382,21 +429,20 @@ int main(int argc, char** argv) {
     }
 
     // Create array of Producer pointers, one for each producer specified in the config file
-    Producer** producers = malloc(config -> TotalNumProducers * sizeof(Producer*));
+    Producer** ArrayProducers = malloc(config -> TotalNumProducers * sizeof(Producer*));
 
     // Print the values in config
-
     for (int i = 0; i <= config -> TotalNumProducers; ++i) {
-        producers[i] = malloc(sizeof(Producer*)); // Allocate memory for each producer
-        producers[i] -> id = config -> ArrayProducers[i].id; // Assign each producer its ID from configuration
-        producers[i] -> NumArticles = config -> ArrayProducers[i].NumArticles;
+        ArrayProducers[i] = malloc(sizeof(Producer*)); // Allocate memory for each producer
+        ArrayProducers[i] -> id = config -> ArrayProducers[i].id; // Assign each producer its ID from configuration
+        ArrayProducers[i] -> NumArticles = config -> ArrayProducers[i].NumArticles;
 
         // Create a bounded buffer for each producer with the specified queue size
         // We create here in the main so the dispatcher wil have acess to it.
-        producers[i]-> ProducerBuffer = constructorBoundedBuffer(config -> ArrayProducers[i].QueueLength);
+        ArrayProducers[i]-> ProducerBuffer = constructorBoundedBuffer(config -> ArrayProducers[i].QueueLength);
         // Print the information of the producer before creating the thread
-        printf("Producer %d: id=%d, QueueLength=%d, NumArticles=%d\n", i, producers[i]->id,
-               config->ArrayProducers[i].QueueLength, producers[i]->NumArticles);
+//        printf("Producer %d: id=%d, QueueLength=%d, NumArticles=%d\n", i, ArrayProducers[i]->id,
+//               config -> ArrayProducers[i].QueueLength, ArrayProducers[i] -> NumArticles);
     }
 
     // Create an array of BoundedBuffer pointers, one for each type of message
@@ -408,7 +454,7 @@ int main(int argc, char** argv) {
 
     // Create a dispatcher and assign the producers to it
     Dispatcher* dispatcher = malloc(sizeof(Dispatcher));
-    dispatcher -> producers = producers;
+    dispatcher -> producers = ArrayProducers;
     dispatcher -> TotalNumProducers = config -> TotalNumProducers;
     dispatcher -> DispatcherBuffersArray = DispatcherBuffersArray;  // Assign DispatcherBuffersArray
 
@@ -417,7 +463,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i <= config -> TotalNumProducers; ++i) {
         // The third argument is the function to be executed by the thread
         // The fourth argument is passed as the sole argument of that function
-        pthread_create(&ProducerThreads[i], NULL, producerThread, producers[i]);
+        pthread_create(&ProducerThreads[i], NULL, producerThread, ArrayProducers[i]);
     }
 
     // Create a thread for the dispatcher with set the function
@@ -425,31 +471,36 @@ int main(int argc, char** argv) {
     pthread_create(&dispatcher_thread_id, NULL, dispatcherThread, dispatcher);
 
 
-    // Create an array of UnboundedBuffer pointers, one for each co-editor specified in the config file
-    UnboundedBuffer** CoEditorBuffers = malloc(config -> QueueLengthCoEditor * sizeof(UnboundedBuffer*));
-    for (int i = 0; i < config -> QueueLengthCoEditor; ++i) {
-        CoEditorBuffers[i] = constructorUnboundedBuffer();
+
+    // Create a shared bounded buffer for the co-editors and the manager
+    BoundedBuffer* SharedBuffer = constructorBoundedBuffer(config -> QueueLengthCoEditor);
+
+    // Create co-editor threads
+    pthread_t* coEditorThreads = malloc(NUM_ARTICLES_TYPES * sizeof(pthread_t));
+    CoEditor** ArrayCoEditors = malloc(NUM_ARTICLES_TYPES * sizeof(CoEditor*));
+
+    for (int i = 0; i < NUM_ARTICLES_TYPES; ++i) {
+        ArrayCoEditors[i] = malloc(sizeof(CoEditor));
+        ArrayCoEditors[i] -> dispatcherBuffer = dispatcher -> DispatcherBuffersArray[i];
+        ArrayCoEditors[i] -> SharedBuffer = SharedBuffer;
+        pthread_create(&coEditorThreads[i], NULL, coEditorThread, ArrayCoEditors[i]);
+        //printf("Created CoEditorThread %d\n", i);
+
     }
 
-    // Create a co-editor and assign the co-editor buffers to it
-    CoEditor* coEditor = malloc(sizeof(CoEditor));
-    coEditor -> coEditorBuffers = CoEditorBuffers;
-    coEditor -> TotalNumCoEditors = config -> QueueLengthCoEditor;
-
-    // Create a manager and assign a buffer to it
+    // Allocate memory for Struct manager and declare it.
     Manager* manager = malloc(sizeof(Manager));
-    manager -> ManagerBuffer = constructorUnboundedBuffer();
+    manager -> SharedBuffer = SharedBuffer;
+    manager -> doneCount = 0;
 
-    // Create threads for the co-editors and the manager
-    pthread_t* CoEditorThreads = malloc(config -> QueueLengthCoEditor * sizeof(pthread_t));
-    for (int i = 0; i < config->QueueLengthCoEditor; ++i) {
-        pthread_create(&CoEditorThreads[i], NULL, coEditorThread, (void*)coEditor after this.
-
-
+    // Create manager thread
+    pthread_t ManagerThreadID;
+    pthread_create(&ManagerThreadID, NULL, managerThread, manager);
 
 
+    // Join threads
 
-        // Wait for all producer threads to finish execution
+           // Wait for all producer threads to finish execution
     for (int i = 0; i < config -> TotalNumProducers; ++i) {
         pthread_join(ProducerThreads[i], NULL);
     }
@@ -457,20 +508,35 @@ int main(int argc, char** argv) {
     // Wait for the dispatcher thread to finish execution
     pthread_join(dispatcher_thread_id, NULL);
 
+
+    for (int i = 0; i < NUM_ARTICLES_TYPES; ++i) {
+        pthread_join(coEditorThreads[i], NULL);
+        free(ArrayCoEditors[i]); // Free CoEditorArgs when they're no longer needed
+    }
+    //printf("We are waiting to the manager thread to finish");
+    pthread_join(ManagerThreadID, NULL);
+    //printf("######### \n We are STOPPED waiting for the manager thread. \n ########################");
+
+
+
+
     // Clean up all dynamically allocated memory
     for (int i = 0; i < config -> TotalNumProducers; ++i) {
-        free(producers[i]);
+        free(ArrayProducers[i]);
     }
-    free(producers);
+    free(ArrayProducers);
     free(config -> ArrayProducers);
     free(config);
     for (int i = 0; i < NUM_ARTICLES_TYPES; ++i) {
         free(DispatcherBuffersArray[i] -> buffer);
         free(DispatcherBuffersArray[i]);
     }
+
     free(DispatcherBuffersArray);
     free(dispatcher);
     free(ProducerThreads);
-
+    free(coEditorThreads);
+    free(ArrayCoEditors);
+    free(manager);
     return 0;
 }
