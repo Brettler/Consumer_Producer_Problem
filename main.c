@@ -400,7 +400,7 @@ void free_config(Config* config) {
 }
 
 int main(int argc, char** argv) {
-
+ // god damn
     if (argc != 2) {
         printf("Usage: %s <config file>\n", argv[0]);
         return 1;
